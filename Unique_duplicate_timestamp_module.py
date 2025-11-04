@@ -362,7 +362,6 @@ def parse_raw_to_csv(input_path: Path) -> Path:
             "events",
             "product-string",
             "impressionData",
-            "timestamp",
         ]
         ev = sorted([c for c in cols if re.match(r"eVar\d+$", c, re.I)])
         pr = sorted([c for c in cols if re.match(r"prop\d+$", c, re.I)])

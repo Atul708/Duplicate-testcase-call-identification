@@ -3,18 +3,16 @@
 """
 pipeline_gdrive_full_unified.py
 
-Notebook/Colab-friendly unified pipeline with Google Drive I/O:
+Unified pipeline with Google Drive I/O (Jupyter/Colab friendly)
+Steps:
   1) Parse semi-JSON/text → CSV with Excel-safe IST TIMESTAMP
-  2) Classify modules
+  2) Classify modules (module right after custom_event_name; tails at the end)
   3) Detect adjacent duplicates (row i vs i-1 within N seconds)
   4) Consolidate unique-from-duplicates
 
-- Input can be: Google Drive SHARE LINK or Drive/local PATH (.json/.csv/.xlsx)
-- If a share link is used, outputs are uploaded back to the SAME Drive folder
-- Colab: uses built-in OAuth (no client_secrets.json). Local: pydrive2 for upload.
-- No argparse (clean in Jupyter). Prompts for input and options.
-
-Recommended repo file name: pipeline_gdrive_full_unified.py
+- Accepts Google Drive SHARE LINK or Drive/local PATH (.json/.csv/.xlsx)
+- Uploads outputs back to the SAME Drive folder as the shared input
+- Prints Adjacent Duplicates (preview) and FINAL UNIQUE DUPLICATE ROWS in a BOX
 """
 
 from __future__ import annotations
@@ -34,11 +32,16 @@ from collections import Counter
 import pandas as pd
 
 # --------------------------------------------------------------------------------------
-# Pretty print (tabulate if available)
+# Pretty print (tabulate if available) — BOXED output
 # --------------------------------------------------------------------------------------
-def pretty_print(df: pd.DataFrame, limit: int = 100):
+def pretty_print(df: pd.DataFrame, limit: int = 200, title: str | None = None):
+    if title:
+        bar = "=" * max(80, len(title))
+        print("\n" + bar)
+        print(title)
+        print(bar)
     try:
-        from tabulate import tabulate
+        from tabulate import tabulate  # type: ignore
         print(tabulate(df.head(limit), headers="keys", tablefmt="fancy_grid", showindex=False))
     except Exception:
         s = df.head(limit).to_string(index=False)
@@ -243,7 +246,7 @@ def sniff_filetype_and_fix_extension(path: Path) -> Path:
         print(f"ℹ️ Inferred XLSX and renamed to: {newp.name}")
         return newp
     text = head.decode("utf-8", errors="ignore").lstrip()
-    if text.startswith("{") or text.startswith("["):
+    if text.startswith("{") or text.startswith("[" ):
         newp = path.with_suffix(".json")
         path.rename(newp)
         print(f"ℹ️ Inferred JSON and renamed to: {newp.name}")
@@ -374,7 +377,7 @@ def parse_raw_to_csv(input_path: Path) -> Path:
     return written
 
 # --------------------------------------------------------------------------------------
-# Stage 2 — Module classification
+# Stage 2 — Module classification (ordering fixed per your requirement)
 # --------------------------------------------------------------------------------------
 MODULE_KEYWORDS: Dict[str, Dict[str, List[str]]] = {
     "Home page":   {"custom": ["onboarding", "home page", "notification response", "content link click"],
@@ -432,14 +435,21 @@ def _e43_45_single(row: pd.Series) -> List[str]:
     mods = _mods_in_text(row.get("eVar43", "")) | _mods_in_text(row.get("eVar45", ""))
     return list(mods) if len(mods) == 1 else []
 
+def _insert_after(cols: list[str], anchor: str, item: str) -> list[str]:
+    cols = [c for c in cols if c != item]
+    if anchor in cols:
+        i = cols.index(anchor) + 1
+        return cols[:i] + [item] + cols[i:]
+    return cols + [item]
+
 def classify_modules(parsed_csv: Path) -> Path:
     parsed_csv = Path(parsed_csv)
     out_path = parsed_csv.with_name(f"{parsed_csv.stem}_modules.csv")
 
     df = pd.read_csv(parsed_csv, dtype=str, keep_default_na=False).replace({"": pd.NA})
-    original_order = list(df.columns)
+    original_order = list(df.columns)  # preserve
 
-    # Initial pass
+    # --- initial module inference ---
     initial_modules: List[str] = []
     for _, r in df.iterrows():
         m = _text_modules(r)
@@ -448,14 +458,12 @@ def classify_modules(parsed_csv: Path) -> Path:
         initial_modules.append(", ".join(m) if m else "")
     df["module"] = initial_modules
 
-    # account created overrides
+    # --- overrides ---
     for i, r in df.iterrows():
-        p43 = _norm_text(r.get("prop43", ""))
-        p45 = _norm_text(r.get("prop45", ""))
+        p43 = _norm_text(r.get("prop43", "")); p45 = _norm_text(r.get("prop45", ""))
         if "account created" in p43 or "|account created" in p45:
             df.at[i, "module"] = "My account"
 
-    # eVar43/45 single override
     for i, r in df.iterrows():
         cur = df.at[i, "module"] or ""
         if "," in cur or cur == "":
@@ -463,7 +471,6 @@ def classify_modules(parsed_csv: Path) -> Path:
             if s:
                 df.at[i, "module"] = s[0]
 
-    # ZONE rule via eVar216
     for i, r in df.iterrows():
         if df.at[i, "module"] in ("", "Unknown"):
             e216 = _norm_text(r.get("eVar216", ""))
@@ -474,7 +481,7 @@ def classify_modules(parsed_csv: Path) -> Path:
 
     df["module"] = df["module"].replace({"": "Unknown"})
 
-    # Next-row fill via eVar29/eVar30 suggested next
+    # --- look-ahead/back fill aids ---
     nav_for_next = df.apply(
         lambda r: ", ".join(sorted(
             (_mods_in_text(r.get("eVar29", "")) | _mods_in_text(r.get("eVar30", "")))
@@ -486,7 +493,7 @@ def classify_modules(parsed_csv: Path) -> Path:
     mask_fill = (df["module"] == "Unknown") & df["_nav_for_me"].fillna("").ne("")
     df.loc[mask_fill, "module"] = df.loc[mask_fill, "_nav_for_me"]
 
-    # possible_module & module_chain for Unknown rows
+    # --- possible_module & module_chain for Unknowns ---
     def window_modules(idx: int, k: int = 5) -> List[str]:
         lo, hi = max(0, idx - k), min(len(df), idx + k + 1)
         return [df.at[j, "module"] for j in range(lo, hi) if j != idx]
@@ -518,17 +525,34 @@ def classify_modules(parsed_csv: Path) -> Path:
             df.at[i, "possible_module"] = most_freq(window_modules(i))
         df.at[i, "module_chain"] = chain_view(i)
 
-    # Final column order: keep original + new tails at end
-    df.drop(columns=["_nav_for_me"], inplace=True, errors="ignore")
-    for c in ["module", "possible_module", "module_chain", "_nav_for_next_str"]:
+    # --- final column ordering rules ---
+    for c in ["module", "possible_module", "module_chain", "_nav_for_next_str", "custom_event_name"]:
         if c not in df.columns:
             df[c] = pd.NA
-    end_cols = [c for c in df.columns if c not in ("module", "possible_module", "module_chain", "_nav_for_next_str")] + \
-               ["module", "possible_module", "module_chain", "_nav_for_next_str"]
-    df = df.reindex(columns=end_cols)
+
+    final_cols = original_order.copy()
+
+    # place 'module' immediately AFTER 'custom_event_name'
+    final_cols = _insert_after(final_cols, "custom_event_name", "module")
+
+    # force tail columns at the END (and in this exact order)
+    for tail in ["possible_module", "module_chain", "_nav_for_next_str"]:
+        if tail in final_cols:
+            final_cols.remove(tail)
+    final_cols = [c for c in final_cols if c in df.columns]
+    final_cols += ["possible_module", "module_chain", "_nav_for_next_str"]
+
+    # append any new/unseen columns just before the enforced tail trio
+    seen = set(final_cols)
+    for c in df.columns:
+        if c not in seen:
+            final_cols.insert(-3, c)
+
+    df.drop(columns=["_nav_for_me"], inplace=True, errors="ignore")
+    df = df.reindex(columns=final_cols)
 
     written = safe_to_csv(df, out_path, encoding="utf-8")
-    print(f"✅ Module classified → {written}")
+    print(f"✅ Module classified (ordering fixed) → {written}")
     return written
 
 # --------------------------------------------------------------------------------------
@@ -580,11 +604,14 @@ def detect_adjacent_duplicates(path: Path, window: int = 5) -> Path:
 
     dup_df = df.loc[dup].drop(columns=["__ts"]).copy()
     written = safe_to_csv(dup_df, out, encoding="utf-8")
-    print(f"✅ Adjacent dup ≤{window}s: {len(dup_df)} rows → {written}")
+
+    # BOXED preview for Adjacent Duplicates
+    pretty_print(dup_df, limit=200, title=f"ADJACENT DUPLICATES (≤{window}s) — preview (rows: {len(dup_df)})")
+    print(f"💾 Saved Adjacent Duplicates → {written}")
     return written
 
 # --------------------------------------------------------------------------------------
-# Stage 4 — Unique-from-duplicates consolidation
+# Stage 4 — Unique-from-duplicates consolidation (BOXED print)
 # --------------------------------------------------------------------------------------
 IGNORE_COLS_UNIQUE = {
     "TIMESTAMP","messageReceivedTime","message_received_time","receivedTime",
@@ -616,14 +643,14 @@ def unique_from_duplicates(dups_csv: Path) -> Path:
 
     if df.empty:
         written = safe_to_csv(df.head(0), out, encoding="utf-8")
-        print(f"ℹ️ No duplicate groups; saved empty unique set → {written}")
+        pretty_print(df, title="FINAL UNIQUE DUPLICATE ROWS — (none)")
+        print(f"💾 Saved empty set → {written}")
         return written
 
     evar_cols = [c for c in df.columns if c.lower().startswith("evar")]
     prop_cols = [c for c in df.columns if c.lower().startswith("prop")]
     base_cols = [c for c in COMPARE_BASE if c in df.columns]
     compare_cols = [c for c in (base_cols + evar_cols + prop_cols) if c not in IGNORE_COLS_UNIQUE]
-
     if not compare_cols:
         compare_cols = [c for c in df.columns if c not in IGNORE_COLS_UNIQUE]
 
@@ -636,7 +663,8 @@ def unique_from_duplicates(dups_csv: Path) -> Path:
 
     if groups.empty:
         written = safe_to_csv(df.head(0), out, encoding="utf-8")
-        print(f"ℹ️ No duplicate groups; saved empty unique set → {written}")
+        pretty_print(groups, title="FINAL UNIQUE DUPLICATE ROWS — (no groups detected)")
+        print(f"💾 Saved empty set → {written}")
         return written
 
     uniq = groups.drop_duplicates(subset=compare_cols, keep="first").copy()
@@ -648,7 +676,10 @@ def unique_from_duplicates(dups_csv: Path) -> Path:
             pass
 
     written = safe_to_csv(uniq, out, encoding="utf-8")
-    print(f"✅ Unique-from-duplicates ({len(uniq)} rows) → {written}")
+
+    # BOXED final unique rows
+    pretty_print(uniq, limit=200, title=f"FINAL UNIQUE DUPLICATE ROWS — total: {len(uniq)}")
+    print(f"💾 Saved Unique-from-duplicates → {written}")
     return written
 
 # --------------------------------------------------------------------------------------

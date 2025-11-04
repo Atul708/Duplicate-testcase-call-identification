@@ -614,14 +614,14 @@ def detect_adjacent_duplicates(path: Path, window: int = 5) -> Path:
 # Stage 4 — Unique-from-duplicates consolidation (BOXED print)
 # --------------------------------------------------------------------------------------
 IGNORE_COLS_UNIQUE = {
-    "TIMESTAMP","messageReceivedTime","message_received_time","receivedTime",
+    "__ts","messageReceivedTime","message_received_time","receivedTime",
     "timestamp","event_time","time",
     "initial_test_case_id",
     "module_chain",
     "_nav_for_next_str",
     "test_case_id",
 }
-COMPARE_BASE = {
+_COMPARE_BASE = {
     "custom_event_name",
     "trackaction", "trackAction",
     "events",
@@ -630,58 +630,45 @@ COMPARE_BASE = {
     "module", "possible_module",
 }
 
-def unique_from_duplicates(dups_csv: Path) -> Path:
-    dups_csv = Path(dups_csv)
-    out = dups_csv.with_name(f"{dups_csv.stem}_unique_rows.csv")
-
-    df = pd.read_csv(
-        dups_csv,
-        dtype=str,
-        keep_default_na=False,
-        na_values=["", "NA", "NaN"]
-    ).replace({"": pd.NA})
+def unique_from_duplicates(input_duplicate_csv_path: Path) -> Path:
+    out_path = input_duplicate_csv_path.with_name(f"{input_duplicate_csv_path.stem}_unique_rows.csv")
+    df = pd.read_csv(input_duplicate_csv_path, dtype=str, keep_default_na=False, na_values=["", "NA", "NaN"]).replace({"": pd.NA})
 
     if df.empty:
-        written = safe_to_csv(df.head(0), out, encoding="utf-8")
-        pretty_print(df, title="FINAL UNIQUE DUPLICATE ROWS — (none)")
-        print(f"💾 Saved empty set → {written}")
+        written = safe_to_csv(df, out_path, encoding="utf-8")
+        print("\nNo duplicates => Final unique set is empty.\n")
+        pretty_print(df)
+        print(f"\nSaved: {written}")
         return written
 
     evar_cols = [c for c in df.columns if c.lower().startswith("evar")]
     prop_cols = [c for c in df.columns if c.lower().startswith("prop")]
-    base_cols = [c for c in COMPARE_BASE if c in df.columns]
+    base_cols = [c for c in _COMPARE_BASE if c in df.columns]
     compare_cols = [c for c in (base_cols + evar_cols + prop_cols) if c not in IGNORE_COLS_UNIQUE]
-    if not compare_cols:
-        compare_cols = [c for c in df.columns if c not in IGNORE_COLS_UNIQUE]
 
-    dfn = df.copy()
+    df_norm = df.copy()
     for c in compare_cols:
-        dfn[c] = dfn[c].astype("string").str.strip().str.lower()
+        df_norm[c] = df_norm[c].astype("string").str.strip()
 
-    dupmask = dfn.duplicated(subset=compare_cols, keep=False)
-    groups = df[dupmask].copy()
+    mask = ~df_norm.duplicated(subset=compare_cols, keep="first")
+    unique_df = df.loc[mask].copy()
 
-    if groups.empty:
-        written = safe_to_csv(df.head(0), out, encoding="utf-8")
-        pretty_print(groups, title="FINAL UNIQUE DUPLICATE ROWS — (no groups detected)")
-        print(f"💾 Saved empty set → {written}")
-        return written
-
-    uniq = groups.drop_duplicates(subset=compare_cols, keep="first").copy()
-    if "test_case_id" in uniq.columns:
+    if "test_case_id" in unique_df.columns:
         try:
-            uniq["test_case_id"] = pd.to_numeric(uniq["test_case_id"], errors="coerce")
-            uniq = uniq.sort_values(by=["test_case_id"], kind="mergesort")
+            unique_df["test_case_id"] = pd.to_numeric(unique_df["test_case_id"], errors="coerce")
+            unique_df = unique_df.sort_values(by=["test_case_id"], kind="mergesort")
         except Exception:
             pass
 
-    written = safe_to_csv(uniq, out, encoding="utf-8")
+    written = safe_to_csv(unique_df, out_path, encoding="utf-8")
 
-    # BOXED final unique rows
-    pretty_print(uniq, limit=200, title=f"FINAL UNIQUE DUPLICATE ROWS — total: {len(uniq)}")
-    print(f"💾 Saved Unique-from-duplicates → {written}")
+    print("\n" + "="*100)
+    print("FINAL UNIQUE DUPLICATE ROWS Total rows: {len(unique_df)}".center(100))
+    print("="*100 + "\n")
+    pretty_print(unique_df)
+    print(f"\nSaved: {written} | Total rows: {len(unique_df)}")
+    print("="*100)
     return written
-
 # --------------------------------------------------------------------------------------
 # Orchestrator
 # --------------------------------------------------------------------------------------

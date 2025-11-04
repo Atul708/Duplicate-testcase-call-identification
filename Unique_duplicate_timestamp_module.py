@@ -663,7 +663,7 @@ def unique_from_duplicates(input_duplicate_csv_path: Path) -> Path:
     written = safe_to_csv(unique_df, out_path, encoding="utf-8")
 
     print("\n" + "="*100)
-    print("FINAL UNIQUE DUPLICATE ROWS Total rows: {len(unique_df)}".center(100))
+    print(f"{'FINAL UNIQUE DUPLICATE ROWS - Total rows: ' + str(len(unique_df))}".center(100))
     print("="*100 + "\n")
     pretty_print(unique_df)
     print(f"\nSaved: {written} | Total rows: {len(unique_df)}")

@@ -7,12 +7,12 @@ Unified pipeline with Google Drive I/O (Jupyter/Colab friendly)
 Steps:
   1) Parse semi-JSON/text → CSV with Excel-safe IST TIMESTAMP
   2) Classify modules (module right after custom_event_name; tails at the end)
-  3) Detect adjacent duplicates (row i vs i-1 within N seconds)
-  4) Consolidate unique-from-duplicates
+  3) Detect adjacent duplicates (row i vs i-1 within N seconds)  [drops raw 'timestamp' in the output]
+  4) Consolidate unique-from-duplicates (pairwise via group keys)
 
-- Accepts Google Drive SHARE LINK or Drive/local PATH (.json/.csv/.xlsx)
-- Uploads outputs back to the SAME Drive folder as the shared input
-- Prints Adjacent Duplicates (preview) and FINAL UNIQUE DUPLICATE ROWS in a BOX
+CSV column order for every output:
+TIMESTAMP → module → trackaction → custom_event_name → impressionData → events → product-string
+→ all eVars → all props → test_case_id → others
 """
 
 from __future__ import annotations
@@ -71,10 +71,6 @@ def ensure_colab_drive_mounted() -> None:
         pass
 
 def resolve_gdrive_path(user_text: str) -> Path:
-    """
-    If in Colab and relative path is provided, assume /content/drive/MyDrive base.
-    Otherwise, treat as-is.
-    """
     s = user_text.strip().strip('"').strip("'")
     p = Path(s)
     if in_colab():
@@ -103,9 +99,6 @@ class _ChDir:
             os.chdir(self._old)
 
 def download_from_drive_url(url: str) -> Tuple[Path, str]:
-    """
-    Download a Drive share link via gdown. Returns (local_file_path, file_id).
-    """
     m = re.search(r"/d/([^/]+)/", url) or re.search(r"[?&]id=([^&]+)", url)
     if not m:
         raise SystemExit("ERROR: Could not extract file id from the Drive link.")
@@ -117,7 +110,6 @@ def download_from_drive_url(url: str) -> Tuple[Path, str]:
 
     import gdown
 
-    # Choose a download directory
     if in_colab():
         ensure_colab_drive_mounted()
         dl_dir = Path("/content/drive/MyDrive/_pipeline_inputs")
@@ -140,10 +132,6 @@ def download_from_drive_url(url: str) -> Tuple[Path, str]:
     return p, file_id
 
 def resolve_input_any(user_text: str) -> Tuple[Path, Optional[str]]:
-    """
-    If Drive share link → download via gdown and return (local_path, file_id).
-    Else → return (resolved_path, None).
-    """
     s = user_text.strip().strip('"').strip("'")
     if "drive.google.com" in s:
         p, fid = download_from_drive_url(s)
@@ -233,9 +221,6 @@ def upload_outputs_back_same_folder_local(file_id: str, local_paths: List[Path])
 # File-type detection & CSV writer
 # --------------------------------------------------------------------------------------
 def sniff_filetype_and_fix_extension(path: Path) -> Path:
-    """
-    If file has no extension, try to infer and rename.
-    """
     if path.suffix:
         return path
     with open(path, "rb") as f:
@@ -246,7 +231,7 @@ def sniff_filetype_and_fix_extension(path: Path) -> Path:
         print(f"ℹ️ Inferred XLSX and renamed to: {newp.name}")
         return newp
     text = head.decode("utf-8", errors="ignore").lstrip()
-    if text.startswith("{") or text.startswith("[" ):
+    if text.startswith("{") or text.startswith("["):
         newp = path.with_suffix(".json")
         path.rename(newp)
         print(f"ℹ️ Inferred JSON and renamed to: {newp.name}")
@@ -257,9 +242,6 @@ def sniff_filetype_and_fix_extension(path: Path) -> Path:
     return newp
 
 def safe_to_csv(df: pd.DataFrame, path: Path, **kwargs) -> Path:
-    """
-    Write CSV with fallbacks for locked files.
-    """
     path = Path(path)
     candidates = [path] + [path.with_name(f"{path.stem}_unlocked{i}{path.suffix}") for i in range(1, 6)]
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -273,6 +255,29 @@ def safe_to_csv(df: pd.DataFrame, path: Path, **kwargs) -> Path:
             last_err = e
             continue
     raise PermissionError(f"Could not write CSV (locked?). Last error: {last_err}")
+
+# --------------------------------------------------------------------------------------
+# Common column ordering (APPLIED TO EVERY OUTPUT)
+# --------------------------------------------------------------------------------------
+def order_columns_for_output(df: pd.DataFrame) -> List[str]:
+    """
+    Desired order:
+    TIMESTAMP → module → trackaction → custom_event_name → impressionData → events → product-string
+    → all eVars → all props → test_case_id → others
+    """
+    cols = list(df.columns)
+    lead = [c for c in ["TIMESTAMP", "module", "trackaction", "custom_event_name",
+                        "impressionData", "events", "product-string"] if c in cols]
+    evars = sorted([c for c in cols if c.lower().startswith("evar")])
+    props = sorted([c for c in cols if c.lower().startswith("prop")])
+    tail_keys = []
+    if "test_case_id" in cols:
+        tail_keys.append("test_case_id")
+
+    consumed = set(lead + evars + props + tail_keys)
+    others = [c for c in cols if c not in consumed]
+
+    return lead + evars + props + tail_keys + others
 
 # --------------------------------------------------------------------------------------
 # Stage 1 — Parse semi-JSON/text → CSV with IST TIMESTAMP (Excel-safe)
@@ -290,11 +295,6 @@ RE_CUSTOM_EVENT = re.compile(r'"custom_event_name"\s*:\s*"([^"]*)"')
 RE_TS_MS = re.compile(r'"timestamp"\s*:\s*(\d{10,}(?:\.\d+)?)')
 
 def parse_raw_to_csv(input_path: Path) -> Path:
-    """
-    Produces:
-      - shifted 'timestamp' (up by one row)
-      - Excel-safe 'TIMESTAMP' in IST with ms (UTC -> IST, ceil ms + 1)
-    """
     input_path = Path(input_path)
     out_path = input_path.with_name(f"{input_path.stem}_parsed.csv")
 
@@ -351,32 +351,15 @@ def parse_raw_to_csv(input_path: Path) -> Path:
     else:
         df["TIMESTAMP"] = pd.NA
 
-    # Column order
-    def sort_cols(cols: List[str]) -> List[str]:
-        lead = [
-            "test_case_id",
-            "TIMESTAMP",
-            "messageReceivedTime",
-            "trackaction",
-            "custom_event_name",
-            "events",
-            "product-string",
-            "impressionData",
-        ]
-        ev = sorted([c for c in cols if re.match(r"eVar\d+$", c, re.I)])
-        pr = sorted([c for c in cols if re.match(r"prop\d+$", c, re.I)])
-        rest = [c for c in cols if c not in set(lead + ev + pr)]
-        return [c for c in lead if c in cols] + ev + pr + rest
-
-    if not df.empty:
-        df = df.reindex(columns=sort_cols(list(df.columns)))
+    # Reorder to your shape
+    df = df.reindex(columns=order_columns_for_output(df))
 
     written = safe_to_csv(df, out_path, encoding="utf-8")
     print(f"✅ Parsed saved → {written}")
     return written
 
 # --------------------------------------------------------------------------------------
-# Stage 2 — Module classification (ordering fixed per your requirement)
+# Stage 2 — Module classification (same logic; only final column order adjusted)
 # --------------------------------------------------------------------------------------
 MODULE_KEYWORDS: Dict[str, Dict[str, List[str]]] = {
     "Home page":   {"custom": ["onboarding", "home page", "notification response", "content link click"],
@@ -446,9 +429,8 @@ def classify_modules(parsed_csv: Path) -> Path:
     out_path = parsed_csv.with_name(f"{parsed_csv.stem}_modules.csv")
 
     df = pd.read_csv(parsed_csv, dtype=str, keep_default_na=False).replace({"": pd.NA})
-    original_order = list(df.columns)  # preserve
+    original_order = list(df.columns)
 
-    # --- initial module inference ---
     initial_modules: List[str] = []
     for _, r in df.iterrows():
         m = _text_modules(r)
@@ -457,7 +439,6 @@ def classify_modules(parsed_csv: Path) -> Path:
         initial_modules.append(", ".join(m) if m else "")
     df["module"] = initial_modules
 
-    # --- overrides ---
     for i, r in df.iterrows():
         p43 = _norm_text(r.get("prop43", "")); p45 = _norm_text(r.get("prop45", ""))
         if "account created" in p43 or "|account created" in p45:
@@ -480,7 +461,6 @@ def classify_modules(parsed_csv: Path) -> Path:
 
     df["module"] = df["module"].replace({"": "Unknown"})
 
-    # --- look-ahead/back fill aids ---
     nav_for_next = df.apply(
         lambda r: ", ".join(sorted(
             (_mods_in_text(r.get("eVar29", "")) | _mods_in_text(r.get("eVar30", "")))
@@ -492,7 +472,6 @@ def classify_modules(parsed_csv: Path) -> Path:
     mask_fill = (df["module"] == "Unknown") & df["_nav_for_me"].fillna("").ne("")
     df.loc[mask_fill, "module"] = df.loc[mask_fill, "_nav_for_me"]
 
-    # --- possible_module & module_chain for Unknowns ---
     def window_modules(idx: int, k: int = 5) -> List[str]:
         lo, hi = max(0, idx - k), min(len(df), idx + k + 1)
         return [df.at[j, "module"] for j in range(lo, hi) if j != idx]
@@ -524,31 +503,9 @@ def classify_modules(parsed_csv: Path) -> Path:
             df.at[i, "possible_module"] = most_freq(window_modules(i))
         df.at[i, "module_chain"] = chain_view(i)
 
-    # --- final column ordering rules ---
-    for c in ["module", "possible_module", "module_chain", "_nav_for_next_str", "custom_event_name"]:
-        if c not in df.columns:
-            df[c] = pd.NA
-
-    final_cols = original_order.copy()
-
-    # place 'module' immediately AFTER 'custom_event_name'
-    final_cols = _insert_after(final_cols, "custom_event_name", "module")
-
-    # force tail columns at the END (and in this exact order)
-    for tail in ["possible_module", "module_chain", "_nav_for_next_str"]:
-        if tail in final_cols:
-            final_cols.remove(tail)
-    final_cols = [c for c in final_cols if c in df.columns]
-    final_cols += ["possible_module", "module_chain", "_nav_for_next_str"]
-
-    # append any new/unseen columns just before the enforced tail trio
-    seen = set(final_cols)
-    for c in df.columns:
-        if c not in seen:
-            final_cols.insert(-3, c)
-
+    # Keep all columns; just reorder for output shape
     df.drop(columns=["_nav_for_me"], inplace=True, errors="ignore")
-    df = df.reindex(columns=final_cols)
+    df = df.reindex(columns=order_columns_for_output(df))
 
     written = safe_to_csv(df, out_path, encoding="utf-8")
     print(f"✅ Module classified (ordering fixed) → {written}")
@@ -568,12 +525,10 @@ def _safe_eq(a, b):
     return a == b
 
 def _coerce_ts(series: pd.Series) -> pd.Series:
-    # try epoch ms first
     num = pd.to_numeric(series, errors="coerce")
     ts = pd.to_datetime(num, unit="ms", errors="coerce", utc=True)
     if ts.notna().any():
         return ts
-    # fallback
     return pd.to_datetime(series, errors="coerce", utc=True)
 
 def detect_adjacent_duplicates(path: Path, window: int = 5) -> Path:
@@ -602,15 +557,29 @@ def detect_adjacent_duplicates(path: Path, window: int = 5) -> Path:
             dup[i] = True
 
     dup_df = df.loc[dup].drop(columns=["__ts"]).copy()
+
+    # Drop the raw epoch 'timestamp' from the saved duplicates output, keep 'TIMESTAMP' at the front
+    if "timestamp" in dup_df.columns:
+        dup_df.drop(columns=["timestamp"], inplace=True, errors="ignore")
+
+    # Reorder to your shape
+    dup_df = dup_df.reindex(columns=order_columns_for_output(dup_df))
+
     written = safe_to_csv(dup_df, out, encoding="utf-8")
 
-    # BOXED preview for Adjacent Duplicates
-    pretty_print(dup_df, limit=200, title=f"ADJACENT DUPLICATES (≤{window}s) — preview (rows: {len(dup_df)})")
-    print(f"💾 Saved Adjacent Duplicates → {written}")
+    print("\n" + "="*100)
+    print(f"{'DUPLICATE EVENTS FOUND - Total Rows: ' + str(len(dup_df))}".center(100))
+    print("Please find the detailed information below:".center(100))
+    print("="*100 + "\n")
+    pretty_print(dup_df)
+
+
+    print(f"💾 Saved Duplicate Events → {written}")
     return written
 
 # --------------------------------------------------------------------------------------
 # Stage 4 — Unique-from-duplicates consolidation (BOXED print)
+# (Logic unchanged; only the final output order is forced)
 # --------------------------------------------------------------------------------------
 IGNORE_COLS_UNIQUE = {
     "__ts","messageReceivedTime","message_received_time","receivedTime",
@@ -644,49 +613,50 @@ def unique_from_duplicates(input_duplicate_csv_path: Path) -> Path:
     prop_cols = [c for c in df.columns if c.lower().startswith("prop")]
     base_cols = [c for c in _COMPARE_BASE if c in df.columns]
     compare_cols = [c for c in (base_cols + evar_cols + prop_cols) if c not in IGNORE_COLS_UNIQUE]
+    if not compare_cols:
+        compare_cols = [c for c in df.columns if c not in IGNORE_COLS_UNIQUE]
 
-    df_norm = df.copy()
+    dfn = df.copy()
     for c in compare_cols:
-        df_norm[c] = df_norm[c].astype("string").str.strip()
+        dfn[c] = dfn[c].astype("string").str.strip()
 
-    mask = ~df_norm.duplicated(subset=compare_cols, keep="first")
+    # Pairwise equivalence via group keys (compares each row against all others in its key group)
+    mask = ~dfn.duplicated(subset=compare_cols, keep="first")
     unique_df = df.loc[mask].copy()
 
-    if "test_case_id" in unique_df.columns:
-        try:
-            unique_df["test_case_id"] = pd.to_numeric(unique_df["test_case_id"], errors="coerce")
-            unique_df = unique_df.sort_values(by=["test_case_id"], kind="mergesort")
-        except Exception:
-            pass
+    # Reorder to your shape
+    unique_df = unique_df.reindex(columns=order_columns_for_output(unique_df))
 
     written = safe_to_csv(unique_df, out_path, encoding="utf-8")
 
     print("\n" + "="*100)
-    print(f"{'FINAL UNIQUE DUPLICATE ROWS - Total rows: ' + str(len(unique_df))}".center(100))
+    print(f"{'FINAL UNIQUE DUPLICATE ROWS - Total Rows: ' + str(len(unique_df))}".center(100))
     print("="*100 + "\n")
     pretty_print(unique_df)
     print(f"\nSaved: {written} | Total rows: {len(unique_df)}")
     print("="*100)
     return written
+
 # --------------------------------------------------------------------------------------
 # Orchestrator
 # --------------------------------------------------------------------------------------
 def run_pipeline(start_path: Path, dup_window_secs: int = 5) -> Tuple[Path, Path, Path, Path]:
-    """
-    Returns (parsed_csv, modules_csv, adjacent_dups_csv, unique_from_dups_csv)
-    """
     start_path = sniff_filetype_and_fix_extension(start_path)
     ext = start_path.suffix.lower()
     if ext == ".json":
         parsed_csv = parse_raw_to_csv(start_path)
     elif ext == ".csv":
-        # keep naming consistent; if raw CSV, copy to *_parsed.csv
         parsed_csv = start_path.with_name(f"{start_path.stem}_parsed.csv") \
             if "parsed" not in start_path.stem else start_path
         if parsed_csv != start_path and not parsed_csv.exists():
             shutil.copy2(start_path, parsed_csv)
+        # Ensure parsed output ordering if we took the CSV path:
+        df_tmp = pd.read_csv(parsed_csv, dtype=str, keep_default_na=False).replace({"": pd.NA})
+        df_tmp = df_tmp.reindex(columns=order_columns_for_output(df_tmp))
+        safe_to_csv(df_tmp, parsed_csv, encoding="utf-8")
     elif ext == ".xlsx":
         df_x = pd.read_excel(start_path, sheet_name=0, dtype=str).replace({"": pd.NA})
+        df_x = df_x.reindex(columns=order_columns_for_output(df_x))
         parsed_csv = safe_to_csv(df_x, start_path.with_suffix(".csv"), encoding="utf-8")
     else:
         raise SystemExit("❌ Input must be .json/.csv/.xlsx (or no-ext that can be sniffed).")
@@ -703,7 +673,6 @@ if __name__ == "__main__":
     # Ignore any Jupyter kernel args
     sys.argv = [sys.argv[0]]
 
-    # Prompt for input path or Drive share link
     try:
         user_in = input("Enter Google Drive FILE PATH or SHARE LINK (.json/.csv/.xlsx): ").strip()
     except Exception:
@@ -713,19 +682,16 @@ if __name__ == "__main__":
     if not user_in:
         raise SystemExit("No input provided.")
 
-    # Optional: dup window seconds
     try:
         window_txt = input("Enter adjacent-duplicate window seconds (default 5): ").strip()
         dup_window_secs = int(window_txt) if window_txt else 5
     except Exception:
         dup_window_secs = 5
 
-    # Resolve to a real file and (if link) capture Drive file id
     in_path, drive_file_id = resolve_input_any(user_in)
     if not in_path.exists():
         raise SystemExit(f"File not found: {in_path}")
 
-    # In Colab: ensure outputs are saved into Drive (copy working input into Drive if needed)
     if in_colab() and not str(in_path).startswith("/content/drive"):
         ensure_colab_drive_mounted()
         dst_dir = Path("/content/drive/MyDrive/_pipeline_inputs")
@@ -735,10 +701,8 @@ if __name__ == "__main__":
         print(f"Copied working input into Drive so outputs land in Drive: {new_path}")
         in_path = new_path
 
-    # Run pipeline
     parsed_csv, modules_csv, dups_csv, unique_csv = run_pipeline(in_path, dup_window_secs=dup_window_secs)
 
-    # Upload outputs back to the SAME shared folder if a share link was used
     if drive_file_id:
         try:
             if in_colab():
